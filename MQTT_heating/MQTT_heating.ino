@@ -7,6 +7,7 @@
   v3 - added timers, processing of incoming relay commands, split out ethernet fn, multiple DHTs, watchdog
   v4 - add inputs, organise pin definitions
   v5 - introduce arrays, tidy DHT code
+  2019-03-28: add DS18B20 lib, functions
 
   TODO
   - tidy up
@@ -18,12 +19,14 @@
 //#include <Ethernet_STM.h>   // lib for older W5100 LAN module
 #include <PubSubClient.h>
 #include "DHT.h"
+#include <OneWireSTM.h>
 #include <libmaple/iwdg.h>    // watchdog lib
 
 // ========== PIN DEFINITIONS ============
 #define NUM_OF_OUTPUTS 11
 #define NUM_OF_INPUTS 12
-#define NUM_OF_DHTS 4
+#define NUM_OF_DHTS 1
+#define NUM_OF_DS 4
 
 #define GREENLEDPIN PA5
 #define ORANGELEDPIN PA1
@@ -69,13 +72,13 @@
 // ================= *************** ==================
 
 
-#define DHTTYPE DHT22   // DHT 22  (AM2302), AM2321
+#define DHTTYPE DHT22   // DHT 22  (AM2302)
 //#define W5100_ETHERNET_SHIELD // Arduino Ethernet Shield and Compatibles
 #define W5500_ETHERNET_SHIELD   // WIZ550io, ioShield series of WIZnet
 #define STATUS_ANNOUNCE_PERIOD 1000000  // how often to announce uptime
-#define MQTT_TOPIC_OUT "controller02"
-#define MQTT_TOPIC_IN "controller02/command/#"
-#define MQTT_TOPIC_OUTPUT "controller02/command/output"
+#define MQTT_TOPIC_OUT "controller102"
+#define MQTT_TOPIC_IN "controller102/command/#"
+#define MQTT_TOPIC_OUTPUT "controller102/command/output"
 #define MQTT_PORT  1883
 #define MQTT_MSG_LEN  50
 
@@ -85,19 +88,21 @@ String YESNO[] {"NO","YES"};
 
 float h[NUM_OF_DHTS];
 float t[NUM_OF_DHTS];
+float temp[NUM_OF_DS];
 unsigned long uptimeSec;
 bool outputs[NUM_OF_OUTPUTS];
 bool inputs[NUM_OF_INPUTS];
 bool SecTimerFlag;
+bool SampleDsFlag;
 
 // Initialize DHT sensor.
 DHT dht0(ANALOGPIN0, DHTTYPE);
-DHT dht1(ANALOGPIN1, DHTTYPE);
-DHT dht2(ANALOGPIN2, DHTTYPE);
-DHT dht3(ANALOGPIN3, DHTTYPE);
+
+// Initialize DS18B20 sensor.
+OneWire  ds(ANALOGPIN5);
 
 byte mac[]    = {  0x00, 0x00, 0x00, 0xBE, 0xEF, 0x02 };
-IPAddress ip(192, 168, 1, 222);       // not used unless DHCP deactivated
+IPAddress ip(192, 168, 1, 222);       // not used unless DHCP deactivated - remove?
 IPAddress server(192, 168, 1, 99);    // MQTT broker
 
 
@@ -205,44 +210,72 @@ void readDHT() {
       h[selection] = dht0.readHumidity();
       t[selection] = dht0.readTemperature();
       break;
-    case 1:
-      h[selection] = dht1.readHumidity();
-      t[selection] = dht1.readTemperature();
-      break;
-    case 2:
-      h[selection] = dht2.readHumidity();
-      t[selection] = dht2.readTemperature();
-      break;
-    case 3:
-      h[selection] = dht3.readHumidity();
-      t[selection] = dht3.readTemperature();
-      break;
   }
   Serial.print("Read from DHT number ");
   Serial.println(selection);
-  
-  // Check if any reads failed and exit early (to try again).
-//  if (isnan(h[selection]) || isnan(t[selection])) {
-//    Serial.println("Failed to read from DHT sensor 0!");
-//    h0 = 0;
-//    t0 = 0;
-//  }
-//  if (isnan(h1) || isnan(t1)) {
-//    Serial.println("Failed to read from DHT sensor 1!");
-//    h1 = 0;
-//    t1 = 0;
-//  }
-//  if (isnan(h2) || isnan(t2)) {
-//    Serial.println("Failed to read from DHT sensor 2!");
-//    h2 = 0;
-//    t2 = 0;
-//  }
-//  if (isnan(h3) || isnan(t3)) {
-//    Serial.println("Failed to read from DHT sensor 2!");
-//    h3 = 0;
-//    t3 = 0;
-//  }
 }
+
+void sampleDS() {
+  // Send sample temperature cmd to DS18B20 sensors
+  byte onewire_addr[8];
+  byte i;
+  
+  ds.reset_search();
+  // loop through all sensors
+  for ( i=0; i<NUM_OF_DS; i++ ) {
+    if ( !ds.search(onewire_addr)) {
+      Serial.println("DS18B20 Onewire: No more addresses.");
+      return;
+    }
+    if (OneWire::crc8(onewire_addr, 7) != onewire_addr[7]) {
+      Serial.println("DS18B20 Onewire: CRC is not valid!");
+      return;
+    }
+    ds.reset();
+    ds.select(onewire_addr);
+    ds.write(0x44,0);        // start conversion
+  }
+}
+
+void readDS() {
+  // Read temperature from DS18B20 sensors
+  byte onewire_addr[8];
+  byte data[12];
+  byte i,j;
+  
+  ds.reset_search();
+  // loop through all sensors
+  for ( i=0; i<NUM_OF_DS; i++ ) {
+    if ( !ds.search(onewire_addr)) {
+      Serial.println("DS18B20 Onewire: No more addresses.");
+      return;
+    }
+    ds.reset();
+    ds.select(onewire_addr);    
+    ds.write(0xBE);         // Read Scratchpad
+    
+    for ( j = 0; j < 9; j++) {           // we need 9 bytes
+      data[j] = ds.read();
+    }
+  
+    // Convert the data to actual temperature
+    int16_t raw = (data[1] << 8) | data[0];
+    byte cfg = (data[4] & 0x60);
+    // at lower res, the low bits are undefined, so let's zero them
+    if (cfg == 0x00) raw = raw & ~7;  // 9 bit resolution, 93.75 ms
+    else if (cfg == 0x20) raw = raw & ~3; // 10 bit res, 187.5 ms
+    else if (cfg == 0x40) raw = raw & ~1; // 11 bit res, 375 ms
+    //// default is 12 bit resolution, 750 ms conversion time
+  
+    temp[i] = (float)raw / 16.0;
+    Serial.print("DS18B20 #");
+    Serial.print(i);
+    Serial.print(" Temperature = ");
+    Serial.print(temp[i]);
+    Serial.println(" C");
+  }
+}
+
 
 void readInputs()
 {
@@ -312,12 +345,10 @@ void publishInputsOutputs() {
   
   mqttPublishString("status/temperature0",String(t[0]));
   mqttPublishString("status/humidity0", String(h[0]));
-  mqttPublishString("status/temperature1",String(t[1]));
-  mqttPublishString("status/humidity1", String(h[1]));
-  mqttPublishString("status/temperature2",String(t[2]));
-  mqttPublishString("status/humidity2", String(h[2]));
-  mqttPublishString("status/temperature3",String(t[3]));
-  mqttPublishString("status/humidity3", String(h[3]));
+  mqttPublishString("status/watertemp1",String(temp[0]));
+  mqttPublishString("status/watertemp2",String(temp[1]));
+  mqttPublishString("status/watertemp3",String(temp[2]));
+  mqttPublishString("status/watertemp4",String(temp[3]));
 }
 
 void initEthernet()
@@ -340,9 +371,6 @@ void setup()
   Serial.begin(115200);  
 
   dht0.begin();
-  dht1.begin();
-  dht2.begin();
-  dht3.begin();
   
   // setup output pins
   pinMode(OUTPUTPIN0,OUTPUT);
@@ -404,6 +432,11 @@ void loop()
     publishInputsOutputs();
     if(uptimeSec%3 == 0) {
       readDHT();
+      readDS();
+      sampleDS();
+      SampleDsFlag = 1;
+    }
+    else if (SampleDsFlag == 1) {
     }
     iwdg_feed();     // kick watchdog to avoid a reboot
     SecTimerFlag = 0;
